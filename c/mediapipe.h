@@ -59,7 +59,7 @@ typedef enum : int {
 
 /// A structure for wrapping pixel data.
 typedef struct {
-    const uint8_t* data;
+    uint8_t* data;
     int width;
     int height;
     mp_image_format format;
@@ -78,11 +78,11 @@ typedef struct {
     int length;
 } mp_landmark_list;
 
-/// A list of hands or faces detected in an image.
+/// A list of poses detected in an image.
 typedef struct {
     mp_landmark_list* elements;
     int length;
-} mp_multi_face_landmark_list;
+} mp_pose_landmark_list;
 
 /// A rectangle with a rotation in radians.
 typedef struct {
@@ -100,31 +100,43 @@ typedef struct {
     int length;
 } mp_rect_list;
 
-/// Hand landmark indices in a mp_landmark_list.
-/// For more information, see: https://google.github.io/mediapipe/solutions/hands.html#hand-landmark-model
+/// Pose landmark indices in a mp_landmark_list.
+/// For more information, see: https://developers.google.com/mediapipe/solutions/vision/pose_landmarker#models
 typedef enum {
-    mp_hand_landmark_wrist = 0,
-    mp_hand_landmark_thumb_cmc = 1,
-    mp_hand_landmark_thumb_mcp = 2,
-    mp_hand_landmark_thumb_ip = 3,
-    mp_hand_landmark_thumb_tip = 4,
-    mp_hand_landmark_index_finger_mcp = 5,
-    mp_hand_landmark_index_finger_pip = 6,
-    mp_hand_landmark_index_finger_dip = 7,
-    mp_hand_landmark_index_finger_tip = 8,
-    mp_hand_landmark_middle_finger_mcp = 9,
-    mp_hand_landmark_middle_finger_pip = 10,
-    mp_hand_landmark_middle_finger_dip = 11,
-    mp_hand_landmark_middle_finger_tip = 12,
-    mp_hand_landmark_ring_finger_mcp = 13,
-    mp_hand_landmark_ring_finger_pip = 14,
-    mp_hand_landmark_ring_finger_dip = 15,
-    mp_hand_landmark_ring_finger_tip = 16,
-    mp_hand_landmark_pinky_mcp = 17,
-    mp_hand_landmark_pinky_pip = 18,
-    mp_hand_landmark_pinky_dip = 19,
-    mp_hand_landmark_pinky_tip = 20
-} mp_hand_landmark;
+    mp_pose_landmark_nose = 0,
+    mp_pose_landmark_left_eye_inner = 1,
+    mp_pose_landmark_left_eye = 2,
+    mp_pose_landmark_left_eye_outer = 3,
+    mp_pose_landmark_right_eye_inner = 4,
+    mp_pose_landmark_right_eye = 5,
+    mp_pose_landmark_right_eye_outer = 6,
+    mp_pose_landmark_left_ear = 7,
+    mp_pose_landmark_right_ear = 8,
+    mp_pose_landmark_mouth_left = 9,
+    mp_pose_landmark_mouth_right = 10,
+    mp_pose_landmark_left_shoulder = 11,
+    mp_pose_landmark_right_shoulder = 12,
+    mp_pose_landmark_left_elbow = 13,
+    mp_pose_landmark_right_elbow = 14,
+    mp_pose_landmark_left_wrist = 15,
+    mp_pose_landmark_right_wrist = 16,
+    mp_pose_landmark_left_pinky = 17,
+    mp_pose_landmark_right_pinky = 18,
+    mp_pose_landmark_left_index = 19,
+    mp_pose_landmark_right_index = 20,
+    mp_pose_landmark_left_thumb = 21,
+    mp_pose_landmark_right_thumb = 22,
+    mp_pose_landmark_left_hip = 23,
+    mp_pose_landmark_right_hip = 24,
+    mp_pose_landmark_left_knee = 25,
+    mp_pose_landmark_right_knee = 26,
+    mp_pose_landmark_left_ankle = 27,
+    mp_pose_landmark_right_ankle = 28,
+    mp_pose_landmark_left_heel = 29,
+    mp_pose_landmark_right_heel = 30,
+    mp_pose_landmark_left_foot_index = 31,
+    mp_pose_landmark_right_foot_index = 32
+} mp_pose_landmark;
 
 /// Creates an instance builder, which is used by mp_create_instance to create a MediaPipe instance.
 /// The instance builder requires the path to the binary graph and the name of the input stream.
@@ -145,6 +157,10 @@ MEDIAPIPE_API void mp_add_side_packet(mp_instance_builder* instance_builder, con
 /// Returns NULL on failure.
 MEDIAPIPE_API mp_instance* mp_create_instance(mp_instance_builder* builder);
 
+/// Initializes the gpu dependencies
+/// Returns NULL on failure.
+MEDIAPIPE_API mp_instance* mp_initialize_gpu(mp_instance_builder* builder, mp_instance* instance);
+
 /// Creates a poller to read packets from an output stream.
 /// The poller should be deallocated before the instance with mp_destroy_poller.
 /// Returns NULL on failure.
@@ -160,10 +176,14 @@ MEDIAPIPE_API bool mp_start(mp_instance* instance);
 /// Returns true on success.
 MEDIAPIPE_API bool mp_process(mp_instance* instance, mp_packet* packet);
 
+MEDIAPIPE_API bool mp_process_gpu(mp_instance* instance, mp_packet* packet);
+
 /// Blocks until the MediaPipe graph has finished the work submitted with mp_process and
 /// the results are available.
 /// Returns true on success.
 MEDIAPIPE_API bool mp_wait_until_idle(mp_instance* instance);
+
+MEDIAPIPE_API bool mp_wait_until_idle_gpu(mp_instance* instance);
 
 /// Returns the number of packets available in an output stream.
 /// This function should be called before polling packets to avoid infinite blocking.
@@ -202,6 +222,8 @@ MEDIAPIPE_API mp_packet* mp_create_packet_bool(bool value);
 /// The pixel data is copied and not deallocated.
 MEDIAPIPE_API mp_packet* mp_create_packet_image(mp_image image);
 
+MEDIAPIPE_API mp_packet* mp_create_packet_image_gpu(mp_instance* instance, mp_image image);
+
 /// Polls a packet from an output stream.
 /// The packet should be deallocated with mp_destroy_packet.
 MEDIAPIPE_API mp_packet* mp_poll_packet(mp_poller* poller);
@@ -218,16 +240,19 @@ MEDIAPIPE_API void mp_free_packet_type(const char* type);
 /// Copies a packet image into a buffer.
 MEDIAPIPE_API void mp_copy_packet_image(mp_packet* packet, uint8_t* out_data);
 
+/// Copies a packet image into a buffer.
+MEDIAPIPE_API void mp_copy_packet_image_gpu(mp_instance* instance, mp_packet* packet, uint8_t* out_data);
+
 /// Returns the multi-face landmarks of a packet.
-/// The list should be destroyed with mp_destroy_multi_face_landmarks.
-MEDIAPIPE_API mp_multi_face_landmark_list* mp_get_multi_face_landmarks(mp_packet* packet);
+/// The list should be destroyed with mp_destroy_pose_landmarks.
+MEDIAPIPE_API mp_pose_landmark_list* mp_get_pose_landmarks(mp_packet* packet);
 
 /// Returns the normalized multi-face landmarks of a packet.
-/// The list should be destroyed with mp_destroy_multi_face_landmarks.
-MEDIAPIPE_API mp_multi_face_landmark_list* mp_get_norm_multi_face_landmarks(mp_packet* packet);
+/// The list should be destroyed with mp_destroy_pose_landmarks.
+MEDIAPIPE_API mp_pose_landmark_list* mp_get_norm_pose_landmarks(mp_packet* packet);
 
 /// Deallocates a multi-face landmark list.
-MEDIAPIPE_API void mp_destroy_multi_face_landmarks(mp_multi_face_landmark_list* multi_face_landmarks);
+MEDIAPIPE_API void mp_destroy_pose_landmarks(mp_pose_landmark_list* pose_landmarks);
 
 /// Returns the rectangles of a packet.
 /// The list should be destroyed with mp_destroy_rects.

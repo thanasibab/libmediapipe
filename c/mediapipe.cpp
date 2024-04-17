@@ -3,9 +3,16 @@
 #include "mediapipe/framework/calculator_framework.h"
 #include "mediapipe/framework/port/parse_text_proto.h"
 #include "mediapipe/framework/formats/image_frame.h"
+#include "mediapipe/framework/formats/detection.pb.h"
 #include "mediapipe/framework/formats/landmark.pb.h"
 #include "mediapipe/framework/formats/rect.pb.h"
 #include "mediapipe/framework/tool/options_util.h"
+#if !MEDIAPIPE_DISABLE_GPU
+#include "mediapipe/gpu/gpu_shared_data_internal.h"
+#include "mediapipe/gpu/gpu_buffer.h"
+#include "mediapipe/gpu/gl_calculator_helper.h"
+#endif  // MEDIAPIPE_DISABLE_GPU
+
 
 #include "mediapipe/calculators/util/thresholding_calculator.pb.h"
 #include "mediapipe/calculators/tensor/tensors_to_detections_calculator.pb.h"
@@ -25,6 +32,7 @@
 #include <cassert>
 #include <fstream>
 #include <iostream>
+#include <cstdlib>
 
 #ifndef __ANDROID__
 ABSL_DECLARE_FLAG(std::string, resource_root_dir);
@@ -47,6 +55,9 @@ struct mp_instance_builder {
 
 struct mp_instance {
     mediapipe::CalculatorGraph graph;
+#if !MEDIAPIPE_DISABLE_GPU
+    mediapipe::GlCalculatorHelper gpu_helper;
+#endif  // !MEDIAPIPE_DISABLE_GPU
     std::string input_stream;
     size_t frame_timestamp;
 };
@@ -60,33 +71,30 @@ struct mp_packet {
 };
 
 template<typename List, typename Landmark>
-static mp_multi_face_landmark_list* get_multi_face_landmarks(mp_packet* packet) {
-    const auto& mp_data = packet->packet.template Get<std::vector<List>>();
+static mp_pose_landmark_list* get_pose_landmarks(mp_packet* packet) {
+    const auto& mp_list = packet->packet.template Get<List>();
 
-    auto* lists = new mp_landmark_list[mp_data.size()];
+    auto* lists = new mp_landmark_list[1];
 
-    for (int i = 0; i < mp_data.size(); i++) {
-        const List& mp_list = mp_data[i];
-        auto* list = new mp_landmark[mp_list.landmark_size()];
+    auto* list = new mp_landmark[mp_list.landmark_size()];
 
-        for (int j = 0; j < mp_list.landmark_size(); j++) {
-            const Landmark& mp_landmark = mp_list.landmark(j);
-            list[j] = {
-                mp_landmark.x(),
-                mp_landmark.y(),
-                mp_landmark.z()
-            };
-        }
-
-        lists[i] = mp_landmark_list {
-            list,
-            (int) mp_list.landmark_size()
+    for (int j = 0; j < mp_list.landmark_size(); j++) {
+        const Landmark& mp_landmark = mp_list.landmark(j);
+        list[j] = {
+            mp_landmark.x(),
+            mp_landmark.y(),
+            mp_landmark.z()
         };
     }
 
-    return new mp_multi_face_landmark_list {
+    lists[0] = mp_landmark_list {
+        list,
+        (int) mp_list.landmark_size()
+    };
+
+    return new mp_pose_landmark_list {
         lists,
-        (int) mp_data.size()
+        (int) 1
     };
 }
 
@@ -140,7 +148,7 @@ MEDIAPIPE_API mp_instance* mp_create_instance(mp_instance_builder* builder) {
         last_error = absl::Status(absl::StatusCode::kNotFound, "Failed to open graph file");
         return nullptr;
     }
-
+    
     size_t size = stream.tellg();
     stream.seekg(0, std::ios::beg);
 
@@ -191,9 +199,9 @@ MEDIAPIPE_API mp_instance* mp_create_instance(mp_instance_builder* builder) {
     std::cout << str << std::endl;
     
     */
-
     auto* instance = new mp_instance;
     absl::Status result = instance->graph.Initialize(canonical_config, builder->side_packets);
+    
     if (!result.ok()) {
         last_error = result;
         return nullptr;
@@ -205,6 +213,21 @@ MEDIAPIPE_API mp_instance* mp_create_instance(mp_instance_builder* builder) {
     delete builder;
     return instance;
 }
+
+#if !MEDIAPIPE_DISABLE_GPU
+MEDIAPIPE_API mp_instance* mp_initialize_gpu(mp_instance_builder* builder, mp_instance *instance) {
+    absl::StatusOr<std::shared_ptr<mediapipe::GpuResources>> gpu_resources = mediapipe::GpuResources::Create();
+
+    absl::Status result = instance->graph.SetGpuResources(std::move(*gpu_resources));
+    if (!result.ok()) {
+        last_error = result;
+        return nullptr;
+    }
+
+    instance->gpu_helper.InitializeForTest(instance->graph.GetGpuResources().get());
+    return instance;
+}
+#endif  // MEDIAPIPE_DISABLE_GPU
 
 MEDIAPIPE_API mp_poller* mp_create_poller(mp_instance* instance, const char* output_stream) {
     absl::StatusOr<mediapipe::OutputStreamPoller> result = instance->graph.AddOutputStreamPoller(output_stream);
@@ -243,6 +266,26 @@ MEDIAPIPE_API bool mp_process(mp_instance* instance, mp_packet* packet) {
     return true;
 }
 
+MEDIAPIPE_API bool mp_process_gpu(mp_instance* instance, mp_packet* packet) {
+    absl::Status result = instance->gpu_helper.RunInGlContext([&instance, &packet]() -> absl::Status {
+        mediapipe::Timestamp mp_timestamp(instance->frame_timestamp++);
+        mediapipe::Packet mp_packet = packet->packet.At(mp_timestamp);
+        auto result = instance->graph.AddPacketToInputStream(instance->input_stream, mp_packet);
+        mp_destroy_packet(packet);
+
+        if (!result.ok()) {
+            last_error = result;
+            return last_error;
+        }
+
+        return absl::OkStatus();
+    });
+    if (!result.ok()) {
+        return false;
+    }
+    return true;
+}
+
 MEDIAPIPE_API bool mp_wait_until_idle(mp_instance* instance) {
     absl::Status result = instance->graph.WaitUntilIdle();
 
@@ -251,6 +294,22 @@ MEDIAPIPE_API bool mp_wait_until_idle(mp_instance* instance) {
         return false;
     }
 
+    return true;
+}
+
+MEDIAPIPE_API bool mp_wait_until_idle_gpu(mp_instance* instance) {
+    absl::Status result = instance->gpu_helper.RunInGlContext([&instance]() -> absl::Status {
+        auto result = instance->graph.WaitUntilIdle();
+        if (!result.ok()) {
+            last_error = result;
+            return last_error;
+        }
+
+        return absl::OkStatus();
+    });
+    if (!result.ok()) {
+        return false;
+    }
     return true;
 }
 
@@ -323,6 +382,33 @@ MEDIAPIPE_API mp_packet* mp_create_packet_image(mp_image image) {
     };
 }
 
+#if !MEDIAPIPE_DISABLE_GPU
+MEDIAPIPE_API mp_packet* mp_create_packet_image_gpu(mp_instance* instance, mp_image image) {
+    mp_packet *mp_pak;
+    auto mp_frame = std::make_unique<mediapipe::ImageFrame>(mediapipe::ImageFormat::SRGBA, 
+        image.width, image.height, mediapipe::ImageFrame::kGlDefaultAlignmentBoundary);
+    auto mp_format = static_cast<mediapipe::ImageFormat::Format>(image.format);
+    uint32_t mp_alignment_boundary = mediapipe::ImageFrame::kDefaultAlignmentBoundary;
+    mp_frame->CopyPixelData(mp_format, image.width, image.height, image.data, mp_alignment_boundary);
+    absl::Status result = instance->gpu_helper.RunInGlContext([&instance, &mp_pak, &image, &mp_frame]() -> absl::Status {
+          // Convert ImageFrame to GpuBuffer.
+          auto texture = instance->gpu_helper.CreateSourceTexture(*mp_frame.get());
+          auto gpu_frame = texture.GetFrame<mediapipe::GpuBuffer>();
+          glFlush();
+          texture.Release();
+        //   // Send GPU image packet into the graph.
+        //   MP_RETURN_IF_ERROR(graph.AddPacketToInputStream(
+        //       kInputStream, mediapipe::Adopt(gpu_frame.release())
+        //                         .At(mediapipe::Timestamp(frame_timestamp_us))));
+          mp_pak = new mp_packet {
+            mediapipe::Adopt(gpu_frame.release())
+          };
+          return absl::OkStatus();
+        });
+    return mp_pak;
+}
+#endif  // MEDIAPIPE_DISABLE_GPU
+
 MEDIAPIPE_API mp_packet* mp_poll_packet(mp_poller* poller) {
     auto* packet = new mp_packet;
     poller->poller.Next(&packet->packet);
@@ -351,21 +437,47 @@ MEDIAPIPE_API void mp_copy_packet_image(mp_packet* packet, uint8_t* out_data) {
     mp_frame.CopyToBuffer(out_data, data_size);
 }
 
-MEDIAPIPE_API mp_multi_face_landmark_list* mp_get_multi_face_landmarks(mp_packet* packet) {
-    return get_multi_face_landmarks<mediapipe::LandmarkList, mediapipe::Landmark>(packet);
+#if !MEDIAPIPE_DISABLE_GPU
+MEDIAPIPE_API void mp_copy_packet_image_gpu(mp_instance* instance, mp_packet* packet, uint8_t* out_data) {
+    std::unique_ptr<mediapipe::ImageFrame> mp_frame;
+    absl::Status result = instance->gpu_helper.RunInGlContext([&instance, &packet, &out_data, &mp_frame]() -> absl::Status {
+        auto& gpu_frame = packet->packet.Get<mediapipe::GpuBuffer>();
+        auto texture = instance->gpu_helper.CreateSourceTexture(gpu_frame);
+        mp_frame = absl::make_unique<mediapipe::ImageFrame>(
+            mediapipe::ImageFormatForGpuBufferFormat(gpu_frame.format()),
+            gpu_frame.width(), gpu_frame.height(),
+            mediapipe::ImageFrame::kGlDefaultAlignmentBoundary);
+        instance->gpu_helper.BindFramebuffer(texture);
+        const auto info = mediapipe::GlTextureInfoForGpuBufferFormat(
+            gpu_frame.format(), 0, instance->gpu_helper.GetGlVersion());
+        glReadPixels(0, 0, texture.width(), texture.height(), info.gl_format,
+                    info.gl_type, mp_frame->MutablePixelData());
+        glFlush();
+        texture.Release();
+        size_t data_size = mp_frame->PixelDataSizeStoredContiguously();
+        mp_frame->CopyToBuffer(out_data, data_size);
+        return absl::OkStatus();
+    });
+    
+
+}
+#endif  // MEDIAPIPE_DISABLE_GPU
+
+MEDIAPIPE_API mp_pose_landmark_list* mp_get_pose_landmarks(mp_packet* packet) {
+    return get_pose_landmarks<mediapipe::LandmarkList, mediapipe::Landmark>(packet);
 }
 
-MEDIAPIPE_API mp_multi_face_landmark_list* mp_get_norm_multi_face_landmarks(mp_packet* packet) {
-    return get_multi_face_landmarks<mediapipe::NormalizedLandmarkList, mediapipe::NormalizedLandmark>(packet);
+MEDIAPIPE_API mp_pose_landmark_list* mp_get_norm_pose_landmarks(mp_packet* packet) {
+    return get_pose_landmarks<mediapipe::NormalizedLandmarkList, mediapipe::NormalizedLandmark>(packet);
 }
 
-MEDIAPIPE_API void mp_destroy_multi_face_landmarks(mp_multi_face_landmark_list* multi_face_landmarks) {
-    for (int i = 0; i < multi_face_landmarks->length; i++) {
-        delete[] multi_face_landmarks->elements[i].elements;
+MEDIAPIPE_API void mp_destroy_pose_landmarks(mp_pose_landmark_list* pose_landmarks) {
+    for (int i = 0; i < pose_landmarks->length; i++) {
+        delete[] pose_landmarks->elements[i].elements;
     }
 
-    delete[] multi_face_landmarks->elements;
-    delete multi_face_landmarks;
+    delete[] pose_landmarks->elements;
+    delete pose_landmarks;
 }
 
 MEDIAPIPE_API mp_rect_list* mp_get_rects(mp_packet* packet) {
